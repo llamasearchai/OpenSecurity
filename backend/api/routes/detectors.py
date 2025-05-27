@@ -7,14 +7,12 @@ from fastapi import APIRouter, HTTPException, Depends, Body
 from pydantic import BaseModel, Field
 
 from backend.core.logging import get_logger
-from backend.detectors.base import BaseDetector, DetectionResult
+from backend.detectors.manager import get_detector_manager
+from backend.detectors.base import DetectionSeverity
 from backend.api.routes.auth import verify_token
 
 router = APIRouter()
 logger = get_logger("api.detectors")
-
-# Mock detector registry (in production, use a proper registry)
-DETECTORS: Dict[str, BaseDetector] = {}
 
 
 class DetectorInfo(BaseModel):
@@ -25,21 +23,35 @@ class DetectorInfo(BaseModel):
     type: str
     enabled: bool
     stats: Dict[str, Any]
+    configuration: Dict[str, Any]
 
 
 class DetectionRequest(BaseModel):
     """Detection request model."""
-    data: Dict[str, Any] = Field(..., description="Data to analyze")
-    detector_id: Optional[str] = Field(None, description="Specific detector to use")
+    data: Any = Field(..., description="Data to analyze")
+    detector_ids: Optional[List[str]] = Field(None, description="Specific detectors to use")
 
 
 class DetectionResponse(BaseModel):
     """Detection response model."""
-    detector_id: str
-    detector_name: str
     timestamp: str
     detection_count: int
+    detectors_used: List[str]
     results: List[Dict[str, Any]]
+    summary: Dict[str, Any]
+
+
+class TrainingRequest(BaseModel):
+    """Training request model."""
+    training_data: Any = Field(..., description="Training data")
+
+
+class HealthCheckResponse(BaseModel):
+    """Health check response model."""
+    manager_healthy: bool
+    detectors_healthy: Dict[str, Dict[str, Any]]
+    overall_healthy: bool
+    timestamp: str
 
 
 @router.get("/", response_model=List[DetectorInfo])
@@ -48,18 +60,21 @@ async def list_detectors(
 ) -> List[DetectorInfo]:
     """List all available detectors."""
     try:
-        detectors = []
-        for detector_id, detector in DETECTORS.items():
-            detectors.append(DetectorInfo(
-                id=detector.id,
-                name=detector.name,
-                description=detector.description,
-                type=detector.__class__.__name__,
-                enabled=detector.enabled,
-                stats=detector.get_stats(),
-            ))
+        detector_manager = await get_detector_manager()
+        detectors_info = detector_manager.list_detectors()
         
-        return detectors
+        return [
+            DetectorInfo(
+                id=info["id"],
+                name=info["name"],
+                description=info["description"],
+                type=info["stats"].get("type", "Unknown"),
+                enabled=info["enabled"],
+                stats=info["stats"],
+                configuration=info["configuration"]
+            )
+            for info in detectors_info
+        ]
         
     except Exception as e:
         logger.error(f"Error listing detectors: {str(e)}")
@@ -73,10 +88,11 @@ async def get_detector(
 ) -> DetectorInfo:
     """Get detector details by ID."""
     try:
-        if detector_id not in DETECTORS:
-            raise HTTPException(status_code=404, detail="Detector not found")
+        detector_manager = await get_detector_manager()
+        detector = detector_manager.get_detector(detector_id)
         
-        detector = DETECTORS[detector_id]
+        if not detector:
+            raise HTTPException(status_code=404, detail="Detector not found")
         
         return DetectorInfo(
             id=detector.id,
@@ -85,6 +101,7 @@ async def get_detector(
             type=detector.__class__.__name__,
             enabled=detector.enabled,
             stats=detector.get_stats(),
+            configuration=detector.get_configuration()
         )
         
     except HTTPException:
@@ -101,44 +118,42 @@ async def run_detection(
 ) -> DetectionResponse:
     """Run detection on provided data."""
     try:
-        if request.detector_id:
-            if request.detector_id not in DETECTORS:
-                raise HTTPException(status_code=404, detail="Detector not found")
-            detectors_to_run = [DETECTORS[request.detector_id]]
-        else:
-            # Run all enabled detectors
-            detectors_to_run = [d for d in DETECTORS.values() if d.enabled]
+        detector_manager = await get_detector_manager()
         
-        if not detectors_to_run:
-            raise HTTPException(status_code=400, detail="No detectors available")
-        
-        all_results = []
-        detector_name = "Multiple Detectors"
-        detector_id = "multiple"
-        
-        for detector in detectors_to_run:
-            try:
-                results = await detector.process(request.data)
-                all_results.extend([result.to_dict() for result in results])
-                
-                if len(detectors_to_run) == 1:
-                    detector_name = detector.name
-                    detector_id = detector.id
-                    
-            except Exception as e:
-                logger.error(f"Error in detector {detector.id}: {str(e)}")
-                # Continue with other detectors
-        
-        return DetectionResponse(
-            detector_id=detector_id,
-            detector_name=detector_name,
-            timestamp=datetime.utcnow().isoformat(),
-            detection_count=len(all_results),
-            results=all_results,
+        # Run detection
+        results = await detector_manager.detect(
+            data=request.data,
+            detector_ids=request.detector_ids
         )
         
-    except HTTPException:
-        raise
+        # Convert results to dictionaries
+        result_dicts = [result.to_dict() for result in results]
+        
+        # Create summary
+        severity_counts = {}
+        detectors_used = set()
+        
+        for result in results:
+            severity = result.severity.value
+            severity_counts[severity] = severity_counts.get(severity, 0) + 1
+            detectors_used.add(result.detector_id)
+        
+        summary = {
+            "severity_breakdown": severity_counts,
+            "highest_severity": max([r.severity.value for r in results], default="none"),
+            "average_confidence": sum([r.confidence for r in results]) / len(results) if results else 0,
+            "unique_detectors": len(detectors_used),
+            "total_detections": len(results)
+        }
+        
+        return DetectionResponse(
+            timestamp=datetime.utcnow().isoformat(),
+            detection_count=len(results),
+            detectors_used=list(detectors_used),
+            results=result_dicts,
+            summary=summary
+        )
+        
     except Exception as e:
         logger.error(f"Error running detection: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -151,16 +166,13 @@ async def enable_detector(
 ) -> Dict[str, str]:
     """Enable a detector."""
     try:
-        if detector_id not in DETECTORS:
-            raise HTTPException(status_code=404, detail="Detector not found")
-        
-        detector = DETECTORS[detector_id]
-        detector.enable()
+        detector_manager = await get_detector_manager()
+        detector_manager.enable_detector(detector_id)
         
         return {"message": f"Detector {detector_id} enabled"}
         
-    except HTTPException:
-        raise
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error(f"Error enabling detector {detector_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -173,16 +185,13 @@ async def disable_detector(
 ) -> Dict[str, str]:
     """Disable a detector."""
     try:
-        if detector_id not in DETECTORS:
-            raise HTTPException(status_code=404, detail="Detector not found")
-        
-        detector = DETECTORS[detector_id]
-        detector.disable()
+        detector_manager = await get_detector_manager()
+        detector_manager.disable_detector(detector_id)
         
         return {"message": f"Detector {detector_id} disabled"}
         
-    except HTTPException:
-        raise
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error(f"Error disabling detector {detector_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -195,10 +204,12 @@ async def get_detector_config(
 ) -> Dict[str, Any]:
     """Get detector configuration."""
     try:
-        if detector_id not in DETECTORS:
+        detector_manager = await get_detector_manager()
+        detector = detector_manager.get_detector(detector_id)
+        
+        if not detector:
             raise HTTPException(status_code=404, detail="Detector not found")
         
-        detector = DETECTORS[detector_id]
         return detector.get_configuration()
         
     except HTTPException:
@@ -216,16 +227,13 @@ async def update_detector_config(
 ) -> Dict[str, str]:
     """Update detector configuration."""
     try:
-        if detector_id not in DETECTORS:
-            raise HTTPException(status_code=404, detail="Detector not found")
-        
-        detector = DETECTORS[detector_id]
-        detector.set_configuration(config)
+        detector_manager = await get_detector_manager()
+        detector_manager.configure_detector(detector_id, config)
         
         return {"message": f"Detector {detector_id} configuration updated"}
         
-    except HTTPException:
-        raise
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error(f"Error updating detector config {detector_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -234,23 +242,37 @@ async def update_detector_config(
 @router.post("/{detector_id}/train")
 async def train_detector(
     detector_id: str,
-    training_data: List[Dict[str, Any]] = Body(...),
+    request: TrainingRequest,
     current_user: Dict[str, Any] = Depends(verify_token)
 ) -> Dict[str, str]:
     """Train a detector with provided data."""
     try:
-        if detector_id not in DETECTORS:
-            raise HTTPException(status_code=404, detail="Detector not found")
-        
-        detector = DETECTORS[detector_id]
-        await detector.train(training_data)
+        detector_manager = await get_detector_manager()
+        await detector_manager.train_detector(detector_id, request.training_data)
         
         return {"message": f"Detector {detector_id} training completed"}
         
-    except HTTPException:
-        raise
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error(f"Error training detector {detector_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/train-all")
+async def train_all_detectors(
+    training_data: Dict[str, Any] = Body(...),
+    current_user: Dict[str, Any] = Depends(verify_token)
+) -> Dict[str, str]:
+    """Train all detectors with provided data."""
+    try:
+        detector_manager = await get_detector_manager()
+        await detector_manager.train_all_detectors(training_data)
+        
+        return {"message": "All detectors training completed"}
+        
+    except Exception as e:
+        logger.error(f"Error training all detectors: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -261,16 +283,105 @@ async def reset_detector_stats(
 ) -> Dict[str, str]:
     """Reset detector statistics."""
     try:
-        if detector_id not in DETECTORS:
-            raise HTTPException(status_code=404, detail="Detector not found")
-        
-        detector = DETECTORS[detector_id]
-        detector.reset_stats()
+        detector_manager = await get_detector_manager()
+        detector_manager.reset_detector_stats(detector_id)
         
         return {"message": f"Detector {detector_id} statistics reset"}
         
-    except HTTPException:
-        raise
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.error(f"Error resetting detector stats {detector_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/reset-all-stats")
+async def reset_all_stats(
+    current_user: Dict[str, Any] = Depends(verify_token)
+) -> Dict[str, str]:
+    """Reset all detector statistics."""
+    try:
+        detector_manager = await get_detector_manager()
+        detector_manager.reset_all_stats()
+        
+        return {"message": "All detector statistics reset"}
+        
+    except Exception as e:
+        logger.error(f"Error resetting all stats: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/stats/manager")
+async def get_manager_stats(
+    current_user: Dict[str, Any] = Depends(verify_token)
+) -> Dict[str, Any]:
+    """Get detector manager statistics."""
+    try:
+        detector_manager = await get_detector_manager()
+        return detector_manager.get_manager_stats()
+        
+    except Exception as e:
+        logger.error(f"Error getting manager stats: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/stats/comprehensive")
+async def get_comprehensive_stats(
+    current_user: Dict[str, Any] = Depends(verify_token)
+) -> Dict[str, Any]:
+    """Get comprehensive statistics for all detectors."""
+    try:
+        detector_manager = await get_detector_manager()
+        return detector_manager.get_comprehensive_stats()
+        
+    except Exception as e:
+        logger.error(f"Error getting comprehensive stats: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/health/check", response_model=HealthCheckResponse)
+async def health_check(
+    current_user: Dict[str, Any] = Depends(verify_token)
+) -> HealthCheckResponse:
+    """Perform health check on all detectors."""
+    try:
+        detector_manager = await get_detector_manager()
+        health_status = await detector_manager.health_check()
+        
+        return HealthCheckResponse(**health_status)
+        
+    except Exception as e:
+        logger.error(f"Error performing health check: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/manager/enable")
+async def enable_manager(
+    current_user: Dict[str, Any] = Depends(verify_token)
+) -> Dict[str, str]:
+    """Enable the detector manager."""
+    try:
+        detector_manager = await get_detector_manager()
+        detector_manager.enable_manager()
+        
+        return {"message": "Detector manager enabled"}
+        
+    except Exception as e:
+        logger.error(f"Error enabling manager: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/manager/disable")
+async def disable_manager(
+    current_user: Dict[str, Any] = Depends(verify_token)
+) -> Dict[str, str]:
+    """Disable the detector manager."""
+    try:
+        detector_manager = await get_detector_manager()
+        detector_manager.disable_manager()
+        
+        return {"message": "Detector manager disabled"}
+        
+    except Exception as e:
+        logger.error(f"Error disabling manager: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e)) 
