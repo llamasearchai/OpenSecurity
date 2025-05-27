@@ -1,0 +1,118 @@
+[tool.poetry]
+name = "secureml"
+version = "1.0.0"
+description = "ML-Driven Security Detection Platform with OpenAI Agents"
+authors = ["Security Team <security@example.com>"]
+readme = "README.md"
+packages = [{include = "backend"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+fastapi = "^0.104.1"
+uvicorn = {extras = ["standard"], version = "^0.24.0"}
+pydantic = "^2.5.0"
+pydantic-settings = "^2.1.0"
+langchain = "^0.0.350"
+langchain-openai = "^0.0.2"
+langchain-community = "^0.0.10"
+dspy-ai = "^2.4.0"
+openai = "^1.6.0"
+pandas = "^2.1.4"
+numpy = "^1.24.3"
+scikit-learn = "^1.3.2"
+torch = "^2.1.2"
+transformers = "^4.36.0"
+sentence-transformers = "^2.2.2"
+elasticsearch = "^8.11.0"
+redis = "^5.0.1"
+celery = "^5.3.4"
+loguru = "^0.7.2"
+prometheus-client = "^0.19.0"
+sqlalchemy = "^2.0.23"
+alembic = "^1.13.1"
+asyncpg = "^0.29.0"
+psycopg2-binary = "^2.9.9"
+httpx = "^0.25.2"
+aiofiles = "^23.2.1"
+python-multipart = "^0.0.6"
+python-jose = {extras = ["cryptography"], version = "^3.3.0"}
+passlib = {extras = ["bcrypt"], version = "^1.7.4"}
+python-dotenv = "^1.0.0"
+tenacity = "^8.2.3"
+rich = "^13.7.0"
+typer = "^0.9.0"
+structlog = "^23.2.0"
+orjson = "^3.9.10"
+msgpack = "^1.0.7"
+aiocache = "^0.12.2"
+asyncio-mqtt = "^0.16.1"
+websockets = "^12.0"
+sse-starlette = "^1.8.2"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.3"
+pytest-asyncio = "^0.21.1"
+pytest-cov = "^4.1.0"
+pytest-mock = "^3.12.0"
+pytest-xdist = "^3.5.0"
+pytest-benchmark = "^4.0.0"
+mypy = "^1.7.1"
+black = "^23.11.0"
+isort = "^5.12.0"
+flake8 = "^6.1.0"
+bandit = "^1.7.5"
+safety = "^2.3.5"
+pre-commit = "^3.6.0"
+jupyter = "^1.0.0"
+ipython = "^8.18.1"
+factory-boy = "^3.3.0"
+faker = "^20.1.0"
+httpx = "^0.25.2"
+respx = "^0.20.2"
+freezegun = "^1.2.2"
+coverage = {extras = ["toml"], version = "^7.3.2"}
+
+[tool.poetry.group.docs.dependencies]
+mkdocs = "^1.5.3"
+mkdocs-material = "^9.4.8"
+mkdocstrings = {extras = ["python"], version = "^0.24.0"}
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+use_parentheses = true
+ensure_newline_before_comments = true
+line_length = 88
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-v --tb=short --strict-markers"
+markers = [
+    "unit: unit tests",
+    "integration: integration tests",
+    "e2e: end-to-end tests",
+    "agents: OpenAI agents tests",
+    "detectors: detector tests",
+    "pipelines: pipeline tests",
+    "api: API tests",
+]
+asyncio_mode = "auto" 
